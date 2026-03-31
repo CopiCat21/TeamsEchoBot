@@ -17,7 +17,6 @@ public class SpeechConfiguration
     public string Key { get; set; } = string.Empty;
     public string Region { get; set; } = string.Empty;
     public string Language { get; set; } = string.Empty;
-    public string VoiceName { get; set; } = string.Empty;
 }
 
 public class JoinCallRequest

@@ -158,6 +158,28 @@ public class BotService(
         await httpResponseMessage.CopyToHttpResponseAsync(response).ConfigureAwait(false);
     }
 
+    private async void OnHandlerRequestsLeave(string callId)
+    {
+        _logger.LogInformation("CallHandler for {CallId} requested leave (auto-leave).", callId);
+    
+        CallHandler? handler;
+        lock (_handlersLock)
+        {
+            _callHandlers.TryGetValue(callId, out handler);
+        }
+    
+        if (handler == null) return;
+    
+        try
+        {
+            await handler.HangupAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Auto-leave hangup failed for {CallId}.", callId);
+        }
+    }
+
     /// <summary>
     /// Joins a Teams meeting from a meeting join URL.
     ///
@@ -184,7 +206,7 @@ public class BotService(
         // Sendrecv = bot can both receive audio from participants AND send TTS audio back.
         var audioSettings = new AudioSocketSettings
         {
-            StreamDirections = StreamDirection.Sendrecv,
+            StreamDirections = StreamDirection.Recvonly,
             SupportedAudioFormat = AudioFormat.Pcm16K,
         };
 
@@ -203,7 +225,7 @@ public class BotService(
 
         // Create the CallHandler and wire up the AudioSocket BEFORE AddAsync.
         // This guarantees AudioMediaReceived events are not missed during early negotiation.
-        var handler = new CallHandler(mediaSession, _speechConfig, _logger);
+        var handler = new CallHandler(mediaSession, _speechConfig, _logger, OnHandlerRequestsLeave);
 
         // JoinMeetingParameters takes: chatInfo, meetingInfo, mediaSession.
         // Do NOT pass Modality[] here — that overload is for service-hosted media (no AHM).
@@ -234,14 +256,30 @@ public class BotService(
     {
         foreach (var call in args.RemovedResources)
         {
+            CallHandler? handler;
             lock (_handlersLock)
             {
-                if (_callHandlers.TryGetValue(call.Id, out var handler))
+                if (_callHandlers.TryGetValue(call.Id, out handler))
                 {
-                    handler.Dispose();
                     _callHandlers.Remove(call.Id);
-                    _logger.LogInformation("Call {CallId} ended — handler disposed.", call.Id);
                 }
+            }
+    
+            if (handler != null)
+            {
+                // Dispose off the callback thread to avoid blocking
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        handler.Dispose();
+                        _logger.LogInformation("Call {CallId} ended — handler disposed.", call.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error disposing handler for call {CallId}.", call.Id);
+                    }
+                });
             }
         }
     }
@@ -373,5 +411,89 @@ public class BotService(
         if (_client is null)
             throw new InvalidOperationException(
                 "BotService not initialized. Ensure Initialize() is called in Program.cs startup.");
+    }
+    /// <summary>
+    /// Leaves all active calls. Called when user sends "leave" in chat.
+    /// Returns the number of calls that were hung up.
+    /// </summary>
+    public async Task<int> LeaveAllCallsAsync()
+    {
+        EnsureInitialized();
+
+        List<KeyValuePair<string, CallHandler>> activeHandlers;
+        lock (_handlersLock)
+        {
+            activeHandlers = _callHandlers.ToList();
+        }
+
+        if (activeHandlers.Count == 0)
+        {
+            _logger.LogInformation("LeaveAllCalls: No active calls to leave.");
+            return 0;
+        }
+
+        int leftCount = 0;
+        foreach (var (callId, handler) in activeHandlers)
+        {
+            try
+            {
+                _logger.LogInformation("Leaving call {CallId}...", callId);
+                await handler.HangupAsync().ConfigureAwait(false);
+                leftCount++;
+                _logger.LogInformation("Left call {CallId}.", callId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error leaving call {CallId}.", callId);
+            }
+        }
+
+        return leftCount;
+    }
+
+    /// <summary>
+    /// Sets transcription active or inactive on all active calls.
+    /// The bot stays in the meeting but stops/starts processing audio.
+    /// </summary>
+    public async Task<int> SetTranscriptionActiveAsync(bool active)
+    {
+        List<CallHandler> handlers;
+        lock (_handlersLock)
+        {
+            handlers = _callHandlers.Values.ToList();
+        }
+
+        if (handlers.Count == 0)
+        {
+            _logger.LogInformation("SetTranscriptionActive: No active calls.");
+            return 0;
+        }
+
+        int count = 0;
+        foreach (var handler in handlers)
+        {
+            try
+            {
+                await handler.SetTranscriptionActiveAsync(active).ConfigureAwait(false);
+                count++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error setting transcription state.");
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Returns true if the bot is currently in at least one call.
+    /// </summary>
+    public bool HasActiveCalls()
+    {
+        lock (_handlersLock)
+        {
+            return _callHandlers.Count > 0;
+        }
     }
 }

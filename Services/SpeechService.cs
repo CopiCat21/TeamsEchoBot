@@ -4,104 +4,242 @@ using TeamsEchoBot.Models;
 
 namespace TeamsEchoBot.Services;
 
-public class SpeechService : IDisposable
+/// <summary>
+/// Streaming Speech-to-Text using Azure continuous recognition.
+///
+/// TEARDOWN SAFETY:
+///   - TeardownRecognizerAsync wraps StopContinuousRecognitionAsync in a timeout
+///   - _isRunning flag prevents double-teardown
+///   - SemaphoreSlim prevents concurrent Start/Stop/Pause/Resume
+/// </summary>
+public class StreamingSpeechService : IDisposable
 {
     private readonly SpeechConfiguration _config;
     private readonly ILogger _logger;
     private readonly SpeechConfig _speechConfig;
-    private bool _disposed;
 
-    public SpeechService(SpeechConfiguration config, ILogger logger)
+    private PushAudioInputStream? _pushStream;
+    private AudioConfig? _audioConfig;
+    private SpeechRecognizer? _recognizer;
+
+    private bool _disposed;
+    private bool _isRunning;
+    private readonly SemaphoreSlim _stateLock = new(1, 1);
+
+    // Timeout for StopContinuousRecognitionAsync — the Azure SDK can hang
+    // on this call if the native session is in a bad state.
+    private const int StopTimeoutMs = 5_000;
+
+    public StreamingSpeechService(SpeechConfiguration config, ILogger logger)
     {
         _config = config;
         _logger = logger;
 
-        _speechConfig = SpeechConfig.FromSubscription(
-            config.Key, config.Region);
-
+        _speechConfig = SpeechConfig.FromSubscription(config.Key, config.Region);
         _speechConfig.SpeechRecognitionLanguage = config.Language;
-        _speechConfig.SpeechSynthesisVoiceName = config.VoiceName;
 
-        _speechConfig.SetSpeechSynthesisOutputFormat(
-            SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm);
-
-        _logger.LogInformation("SpeechService initialized. Region: {Region}, Language: {Language}, Voice: {Voice}",
-            config.Region, config.Language, config.VoiceName);
+        _logger.LogInformation(
+            "StreamingSpeechService created. Region: {Region}, Language: {Language}",
+            config.Region, config.Language);
     }
 
-    public async Task<string> TranscribeAsync(byte[] pcmBytes)
+    public async Task StartAsync()
+    {
+        await _stateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_isRunning || _disposed) return;
+            await CreateAndStartRecognizerAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+
+    public void PushAudio(byte[] pcmFrame)
+    {
+        if (_disposed || !_isRunning) return;
+
+        try
+        {
+            _pushStream?.Write(pcmFrame);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Stream was closed between the check and the write
+        }
+    }
+
+    public async Task PauseAsync()
+    {
+        await _stateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!_isRunning || _disposed) return;
+            _logger.LogInformation("Pausing continuous recognition...");
+            await TeardownRecognizerAsync().ConfigureAwait(false);
+            _logger.LogInformation("Recognition paused.");
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+
+    public async Task ResumeAsync()
+    {
+        await _stateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_isRunning || _disposed) return;
+            _logger.LogInformation("Resuming continuous recognition...");
+            await CreateAndStartRecognizerAsync().ConfigureAwait(false);
+            _logger.LogInformation("Recognition resumed.");
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+
+    public async Task StopAsync()
+    {
+        await _stateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!_isRunning) return;
+            _logger.LogInformation("Stopping continuous recognition (final)...");
+            await TeardownRecognizerAsync().ConfigureAwait(false);
+            _logger.LogInformation("Recognition stopped.");
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+
+    // ─── Internal lifecycle ───────────────────────────────────────────────
+
+    private async Task CreateAndStartRecognizerAsync()
     {
         var audioFormat = AudioStreamFormat.GetWaveFormatPCM(
             samplesPerSecond: 16000,
             bitsPerSample: 16,
             channels: 1);
 
-        using var pushStream = AudioInputStream.CreatePushStream(audioFormat);
-        using var audioConfig = AudioConfig.FromStreamInput(pushStream);
-        using var recognizer = new SpeechRecognizer(_speechConfig, audioConfig);
+        _pushStream = AudioInputStream.CreatePushStream(audioFormat);
+        _audioConfig = AudioConfig.FromStreamInput(_pushStream);
+        _recognizer = new SpeechRecognizer(_speechConfig, _audioConfig);
 
-        pushStream.Write(pcmBytes);
-        pushStream.Close();
+        _recognizer.Recognizing += OnRecognizing;
+        _recognizer.Recognized += OnRecognized;
+        _recognizer.Canceled += OnCanceled;
+        _recognizer.SessionStarted += (s, e) =>
+            _logger.LogInformation("STT session started. SessionId: {Id}", e.SessionId);
+        _recognizer.SessionStopped += (s, e) =>
+            _logger.LogInformation("STT session stopped. SessionId: {Id}", e.SessionId);
 
-        _logger.LogDebug("STT: Recognizing {Bytes} bytes of PCM audio...", pcmBytes.Length);
+        await _recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
+        _isRunning = true;
+        _logger.LogInformation("Continuous recognition started.");
+    }
 
-        var result = await recognizer.RecognizeOnceAsync().ConfigureAwait(false);
+    private async Task TeardownRecognizerAsync()
+    {
+        // Mark as not running FIRST to stop PushAudio from writing
+        _isRunning = false;
 
-        switch (result.Reason)
+        // Close the push stream first — this signals end-of-audio to the SDK
+        // and helps StopContinuousRecognitionAsync complete faster.
+        if (_pushStream != null)
         {
-            case ResultReason.RecognizedSpeech:
-                _logger.LogInformation("STT success: \"{Text}\"", result.Text);
-                return result.Text;
+            try { _pushStream.Close(); }
+            catch (ObjectDisposedException) { }
+        }
 
-            case ResultReason.NoMatch:
-                _logger.LogInformation("STT: No speech recognized (NoMatch). " +
-                    "Possible causes: audio too quiet, wrong language setting, or non-speech audio.");
-                return string.Empty;
+        // Stop recognition with a timeout.
+        // StopContinuousRecognitionAsync is a blocking native call that can hang
+        // if the SDK's internal session is in a bad state. Without a timeout,
+        // this blocks the thread for up to 10+ seconds (the SDK's internal timeout).
+        if (_recognizer != null)
+        {
+            try
+            {
+                var stopTask = _recognizer.StopContinuousRecognitionAsync();
+                if (await Task.WhenAny(stopTask, Task.Delay(StopTimeoutMs)).ConfigureAwait(false) != stopTask)
+                {
+                    _logger.LogWarning(
+                        "StopContinuousRecognitionAsync timed out after {Ms}ms. " +
+                        "Force-disposing recognizer.", StopTimeoutMs);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error stopping recognizer.");
+            }
 
-            case ResultReason.Canceled:
-                var cancellation = CancellationDetails.FromResult(result);
-                _logger.LogWarning("STT canceled. Reason: {Reason}. Error: {Error}",
-                    cancellation.Reason, cancellation.ErrorDetails);
+            // Unwire events before dispose to prevent callbacks during teardown
+            _recognizer.Recognizing -= OnRecognizing;
+            _recognizer.Recognized -= OnRecognized;
+            _recognizer.Canceled -= OnCanceled;
 
-                if (cancellation.Reason == CancellationReason.Error)
-                    _logger.LogError("STT error code: {Code}. Check Speech API key and region in appsettings.json.",
-                        cancellation.ErrorCode);
+            try { _recognizer.Dispose(); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing recognizer.");
+            }
+            _recognizer = null;
+        }
 
-                return string.Empty;
+        // Dispose audio config after recognizer is gone
+        if (_audioConfig != null)
+        {
+            try { _audioConfig.Dispose(); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing audio config.");
+            }
+            _audioConfig = null;
+        }
 
-            default:
-                _logger.LogWarning("STT: Unexpected result reason: {Reason}", result.Reason);
-                return string.Empty;
+        _pushStream = null;
+    }
+
+    // ─── Event handlers ───────────────────────────────────────────────────
+
+    private void OnRecognizing(object? sender, SpeechRecognitionEventArgs e)
+    {
+        if (e.Result.Reason == ResultReason.RecognizingSpeech)
+        {
+            _logger.LogInformation("[PARTIAL] {Text}", e.Result.Text);
         }
     }
 
-    public async Task<byte[]> SynthesizeAsync(string text)
+    private void OnRecognized(object? sender, SpeechRecognitionEventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return Array.Empty<byte>();
-
-        using var synthesizer = new SpeechSynthesizer(_speechConfig, audioConfig: null);
-
-        _logger.LogDebug("TTS: Synthesizing \"{Text}\" with voice {Voice}", text, _config.VoiceName);
-
-        var result = await synthesizer.SpeakTextAsync(text).ConfigureAwait(false);
-
-        switch (result.Reason)
+        switch (e.Result.Reason)
         {
-            case ResultReason.SynthesizingAudioCompleted:
-                _logger.LogInformation("TTS success: {Bytes} bytes synthesized for \"{Text}\"",
-                    result.AudioData.Length, text);
-                return result.AudioData;
+            case ResultReason.RecognizedSpeech:
+                _logger.LogInformation("[FINAL] {Text}", e.Result.Text);
+                break;
 
-            case ResultReason.Canceled:
-                var cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
-                _logger.LogError("TTS canceled. Reason: {Reason}. Error: {Error}. Code: {Code}",
-                    cancellation.Reason, cancellation.ErrorDetails, cancellation.ErrorCode);
-                return Array.Empty<byte>();
+            case ResultReason.NoMatch:
+                _logger.LogDebug("STT: No match (background noise or silence).");
+                break;
+        }
+    }
 
-            default:
-                _logger.LogWarning("TTS: Unexpected result reason: {Reason}", result.Reason);
-                return Array.Empty<byte>();
+    private void OnCanceled(object? sender, SpeechRecognitionCanceledEventArgs e)
+    {
+        _logger.LogWarning("STT canceled. Reason: {Reason}, Error: {Error}",
+            e.Reason, e.ErrorDetails);
+
+        if (e.Reason == CancellationReason.Error)
+        {
+            _logger.LogError(
+                "STT error code: {Code}. Check Speech API key/region.",
+                e.ErrorCode);
         }
     }
 
@@ -109,5 +247,21 @@ public class SpeechService : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        // If StopAsync was already called by the background task,
+        // these are all null and this is a no-op.
+        // If not (abnormal path), do a best-effort synchronous cleanup.
+        _isRunning = false;
+
+        try { _pushStream?.Close(); } catch { }
+        try { _recognizer?.Dispose(); } catch { }
+        try { _audioConfig?.Dispose(); } catch { }
+
+        _pushStream = null;
+        _recognizer = null;
+        _audioConfig = null;
+
+        _stateLock.Dispose();
+        _logger.LogInformation("StreamingSpeechService disposed.");
     }
 }
